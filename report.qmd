@@ -1,6 +1,7 @@
 ---
 title: "EV Power - Lab 4 Project Report"
-format: typst
+author: Rosie Lu
+format: html
 ---
 
 # Example Solution 1
@@ -8,27 +9,352 @@ format: typst
 ## **Part 0: libraries**
 
 ```{r}
+library(tidyverse)  # dplyr / readr / ggplot2 / tidyr
+library(janitor)    # clean_names (if needed)
+library(stringr)    # string helpers
+library(scales)
+library(readr)
+library(dplyr)
+library(tidyr)
 
 ```
 
-## **Part 1:** **Defining Research Question**
+## **Part 1: Defining Research Question**
+**Chosen Research Question (RQ)**  
+Does a state’s **renewable electricity share** relate to its **EV registrations in 2023**?
 
-Chosen Question:
+**Why this matters**  
+EV climate benefits depend on the electricity mix. A quick association check helps set expectations for policy and infrastructure.
+
+**Operationalization**  
+- *Renewable share (2021–2023)* = state-level renewable use divided by total electricity use (from `renew-use-20xx.csv` and `total-use-20xx.csv`, aggregated by state).  
+- *EV adoption (2023)* = state-level EV registrations from `ev-registrations-by-state-2023.csv`.
+
+**Scope and approach**  
+We will (1) build a state–year table with `renewable_share`, (2) extract 2023 and join EV counts, and (3) run simple descriptive plots to inspect patterns.
+
 
 ## **Part 2: Data Preparation and Cleaning**
 
 ```{r}
+# ---- Part 2: Data Preparation & Cleaning (robust, matches your headers) ----
+
+DATA_DIR <- "data"
+
+# ---------- paths ----------
+renew_paths <- c(
+  `2021` = file.path(DATA_DIR, "renew-use-2021.csv"),
+  `2022` = file.path(DATA_DIR, "renew-use-2022.csv"),
+  `2023` = file.path(DATA_DIR, "renew-use-2023.csv")
+)
+
+total_paths <- c(
+  `2021` = file.path(DATA_DIR, "total-use-2021.csv"),
+  `2022` = file.path(DATA_DIR, "total-use-2022.csv"),
+  `2023` = file.path(DATA_DIR, "total-use-2023.csv")
+)
+
+ev23_path <- file.path(DATA_DIR, "ev-registrations-by-state-2023.csv")
+
+# ---------- helper: safe numeric ----------
+safe_num <- function(x) {
+  if (is.numeric(x)) x else readr::parse_number(as.character(x))
+}
+
+# ---------- renew reader (long, has State / Energy_Source / Renewable_Use_20xx) ----------
+read_renew <- function(path, year_colname) {
+  readr::read_csv(path, show_col_types = FALSE) |>
+    dplyr::rename(state = State) |>
+    dplyr::mutate(state = tolower(state)) |>
+    dplyr::rename(renew_val = !!year_colname) |>
+    dplyr::mutate(renew_val = safe_num(renew_val)) |>
+    dplyr::group_by(state) |>
+    dplyr::summarise(renew_energy = sum(renew_val, na.rm = TRUE), .groups = "drop")
+}
+
+# ---------- total reader (wide, has Energy_Source + state abbreviations) ----------
+read_total <- function(path) {
+  wide <- readr::read_csv(path, show_col_types = FALSE)
+  has_total <- "Energy_Source" %in% names(wide) &&
+               any(wide$Energy_Source %in% c("Total","TOTAL","total"))
+  long <- wide |>
+    tidyr::pivot_longer(cols = -Energy_Source, names_to = "state_abb", values_to = "val") |>
+    dplyr::mutate(val = safe_num(val)) |>
+    dplyr::filter(!is.na(val))
+
+  if (has_total) {
+    long2 <- long |>
+      dplyr::filter(Energy_Source %in% c("Total","TOTAL","total")) |>
+      dplyr::select(state_abb, total_energy = val)
+  } else {
+    long2 <- long |>
+      dplyr::group_by(state_abb) |>
+      dplyr::summarise(total_energy = sum(val, na.rm = TRUE), .groups = "drop")
+  }
+
+  abb_map <- tibble::tibble(
+    state_abb = c("AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+                  "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+                  "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+                  "VA","WA","WV","WI","WY","DC","US"),
+    state = tolower(c(
+      "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut","Delaware",
+      "Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky",
+      "Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota","Mississippi",
+      "Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey","New Mexico",
+      "New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania",
+      "Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
+      "Virginia","Washington","West Virginia","Wisconsin","Wyoming","District of Columbia","US"))
+  )
+
+  long2 |>
+    dplyr::left_join(abb_map, by = "state_abb") |>
+    dplyr::filter(!is.na(state), state != "us") |>
+    dplyr::select(state, total_energy)
+}
+
+# ---------- EV 2023 reader (first col = state name, second col = value) ----------
+read_ev23 <- function(path) {
+  ev_raw <- readr::read_csv(path, show_col_types = FALSE)
+  ev_cols <- names(ev_raw)
+  stopifnot(length(ev_cols) >= 2)  # ensure two columns exist
+  ev_raw |>
+    dplyr::rename(state_raw = !!ev_cols[1], ev_val = !!ev_cols[2]) |>
+    dplyr::mutate(state = tolower(as.character(state_raw)),
+                  ev_count = safe_num(ev_val)) |>
+    dplyr::select(state, ev_count)
+}
+
+# ---------- build yearly tables ----------
+renew_all <- dplyr::bind_rows(
+  read_renew(renew_paths["2021"], "Renewable_Use_2021") |> dplyr::mutate(year = 2021),
+  read_renew(renew_paths["2022"], "Renewable_Use_2022") |> dplyr::mutate(year = 2022),
+  read_renew(renew_paths["2023"], "Renewable_Use_2023") |> dplyr::mutate(year = 2023)
+)
+
+total_all <- dplyr::bind_rows(
+  read_total(total_paths["2021"]) |> dplyr::mutate(year = 2021),
+  read_total(total_paths["2022"]) |> dplyr::mutate(year = 2022),
+  read_total(total_paths["2023"]) |> dplyr::mutate(year = 2023)
+)
+
+ev23 <- read_ev23(ev23_path)
+
+# ---------- join & compute renewable_share ----------
+joined_yearly <- renew_all |>
+  dplyr::left_join(total_all, by = c("state","year")) |>
+  dplyr::mutate(renewable_share = dplyr::if_else(total_energy > 0, renew_energy / total_energy, NA_real_))
+
+df_2023 <- joined_yearly |>
+  dplyr::filter(year == 2023) |>
+  dplyr::left_join(ev23, by = "state")
+
+# ---------- basic checks ----------
+cat("Rows in renew_all:", nrow(renew_all), "\n")
+cat("Rows in total_all:", nrow(total_all), "\n")
+cat("Rows in df_2023:", nrow(df_2023), "\n")
+dplyr::glimpse(joined_yearly)
+dplyr::glimpse(df_2023)
 
 ```
 
 ## **Part 3: Joining / Pivoting Datasets for Analysis**
 
 ```{r}
+# ---- Part 3: Simple EDA (pipe |> version, fixed) ----
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(forcats)
+library(stringr)
+
+# 0) Normalize state strings & rebuild joins (helps avoid empty matches)
+norm_state <- function(s) {
+  s |>
+    tolower() |>
+    stringr::str_replace_all("[^a-z ]", " ") |>
+    stringr::str_squish()
+}
+alias_fix <- function(s) dplyr::recode(
+  s,
+  "dc" = "district of columbia",
+  "washington dc" = "district of columbia",
+  "washington d c" = "district of columbia",
+  "d c" = "district of columbia",
+  .default = s
+)
+
+stopifnot(exists("renew_all"), exists("total_all"), exists("ev23"))
+
+renew_all <- renew_all |> mutate(state = alias_fix(norm_state(state)))
+total_all <- total_all |> mutate(state = alias_fix(norm_state(state)))
+ev23      <- ev23      |> mutate(state = alias_fix(norm_state(state)))
+
+joined_yearly <-
+  renew_all |>
+  left_join(total_all, by = c("state","year")) |>
+  mutate(renewable_share = if_else(is.finite(total_energy) & total_energy > 0,
+                                   renew_energy / total_energy, NA_real_))
+
+df_2023 <-
+  joined_yearly |>
+  filter(year == 2023) |>
+  left_join(ev23, by = "state")
+
+cat("Non-NA pairs in 2023:",
+    sum(is.finite(df_2023$renewable_share) & is.finite(df_2023$ev_count)), "\n")
+
+# 1) Top-10 states by renewable share (2023)
+top10_share <-
+  df_2023 |>
+  filter(is.finite(renewable_share)) |>
+  arrange(desc(renewable_share)) |>
+  slice_head(n = 10) |>
+  mutate(state = fct_reorder(state, renewable_share))
+
+ggplot(top10_share, aes(x = state, y = renewable_share)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Top 10 States by Renewable Share (2023)",
+       x = NULL, y = "Renewable share") +
+  theme_minimal()
+
+# 2) Scatter: renewable share vs EV registrations (2023)
+scatter_df <-
+  df_2023 |>
+  mutate(
+    renewable_share = as.numeric(renewable_share),
+    ev_count        = as.numeric(ev_count)
+  ) |>
+  filter(is.finite(renewable_share), is.finite(ev_count))
+
+ggplot(scatter_df, aes(x = renewable_share, y = ev_count)) +
+  geom_point(alpha = 0.85) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(
+    trans  = "log1p",
+    labels = scales::label_number(scale_cut = scales::cut_si(" "))
+  ) +
+  labs(title = "Renewable Share vs EV Registrations (2023)",
+       x = "Renewable share (2023)",
+       y = "EV registrations (log1p scale)") +
+  theme_minimal()
+
+# 3) Robust correlation
+pairs_df <-
+  scatter_df |>
+  select(renewable_share, ev_count)
+
+if (nrow(pairs_df) >= 2) {
+  corr_val <- cor(pairs_df$renewable_share, log1p(pairs_df$ev_count), use = "complete.obs")
+  cat("Correlation between renewable_share and log1p(EV registrations):",
+      round(corr_val, 3), "\n")
+} else {
+  cat("Correlation not computed: need >= 2 complete pairs; got ",
+      nrow(pairs_df), ".\n", sep = "")
+}
+
 
 ```
 
 ## **Part 4: Mapping Visualization**
 
 ```{r}
+# ---- Part 4: Findings & Simple Model (pipe |> version, minimal) ----
+library(dplyr)
+library(tibble)
+library(scales)
+
+# 0) Guard + prepare analysis data
+stopifnot(exists("df_2023"))
+
+ana_df <-
+  df_2023 |>
+  mutate(
+    renewable_share = as.numeric(renewable_share),
+    ev_count        = as.numeric(ev_count)
+  ) |>
+  filter(is.finite(renewable_share), is.finite(ev_count))
+
+# 1) Quick overview table
+stats_tbl <-
+  ana_df |>
+  summarise(
+    n_rows                 = n(),
+    n_states_with_data     = n_distinct(state),
+    renewable_share_median = median(renewable_share),
+    renewable_share_IQR    = IQR(renewable_share),
+    ev_median              = median(ev_count),
+    ev_IQR                 = IQR(ev_count)
+  ) |>
+  mutate(
+    renewable_share_median = scales::percent(renewable_share_median, accuracy = 0.1),
+    renewable_share_IQR    = scales::percent(renewable_share_IQR,    accuracy = 0.1),
+    ev_median              = format(ev_median, big.mark = ","),
+    ev_IQR                 = format(ev_IQR,    big.mark = ",")
+  )
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::kable(stats_tbl, caption = "Overview of 2023 data used in analysis")
+} else {
+  print(stats_tbl)
+}
+
+# 2) Minimal linear model: log1p(EV) ~ renewable_share
+if (nrow(ana_df) >= 3) {
+  fit     <- lm(log1p(ev_count) ~ renewable_share, data = ana_df)
+  fit_sum <- summary(fit)
+
+  coef_mat <- coef(fit_sum)
+  coef_tbl <-
+    tibble(
+      term      = rownames(coef_mat),
+      estimate  = unname(coef_mat[, 1]),
+      std_error = unname(coef_mat[, 2]),
+      t_value   = unname(coef_mat[, 3]),
+      p_value   = unname(coef_mat[, 4])
+    ) |>
+    mutate(
+      estimate  = round(estimate, 4),
+      std_error = round(std_error, 4),
+      t_value   = round(t_value, 3),
+      p_value   = signif(p_value, 3)
+    )
+
+  if (requireNamespace("knitr", quietly = TRUE)) {
+    knitr::kable(coef_tbl, caption = "OLS: log1p(EV registrations) ~ renewable_share")
+  } else {
+    print(coef_tbl)
+  }
+
+  r2  <- unname(fit_sum$r.squared)
+  r2a <- unname(fit_sum$adj.r.squared)
+  cat("R-squared:", round(r2, 3), " | Adjusted R-squared:", round(r2a, 3), "\n")
+
+  slope <- coef_tbl$estimate[coef_tbl$term == "renewable_share"]
+  if (length(slope) == 1 && is.finite(slope)) {
+    msg <- if (slope > 0) "positive" else if (slope < 0) "negative" else "near zero"
+    cat("Interpretation: the slope on renewable_share is", msg,
+        "(estimate =", round(slope, 4), ").\n")
+  }
+} else {
+  cat("Model not fitted: need at least 3 complete observations; got ",
+      nrow(ana_df), ".\n", sep = "")
+}
+
+# 3) (Optional) small result table for appendix
+results_small <-
+  ana_df |>
+  select(state, renewable_share, ev_count) |>
+  arrange(desc(renewable_share)) |>
+  slice_head(n = 12)
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::kable(results_small, caption = "Top states by renewable share with EV counts (2023)")
+} else {
+  print(results_small)
+}
 
 ```
